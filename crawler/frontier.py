@@ -4,45 +4,49 @@ from collections import Counter
 from urllib.parse import urlparse, urljoin, urldefrag
 from hashlib import sha256
 
+# Optional HTML parser (recommended if installed)
 try:
     from bs4 import BeautifulSoup
 except Exception:
     BeautifulSoup = None
 
+# --------- Analytics state (for report) ---------
 _lock = threading.Lock()
 
-unique_urls = set()
-word_freq = Counter()
-subdomain_to_urls = {}
+unique_urls = set()                 # defragmented URLs
+word_freq = Counter()               # global word frequency
+subdomain_to_urls = {}              # host -> set(urls)
 longest_page = {"url": None, "words": 0}
 pages_processed = 0
+
+# content-based duplicate detection
 content_hashes = set()
 
+# --------- Configuration / heuristics ---------
 STOPWORDS = {
-    "a","about","above","after","again","against","all","am","an","and","any","are","as","at",
-    "be","because","been","before","being","below","between","both","but","by",
-    "can","cannot","could",
-    "did","do","does","doing","down","during",
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at",
+    "be", "because", "been", "before", "being", "below", "between", "both", "but", "by",
+    "can", "cannot", "could",
+    "did", "do", "does", "doing", "down", "during",
     "each",
-    "few","for","from","further",
-    "had","has","have","having","he","her","here","hers","herself","him","himself","his","how",
-    "i","if","in","into","is","it","its","itself",
+    "few", "for", "from", "further",
+    "had", "has", "have", "having", "he", "her", "here", "hers", "herself", "him", "himself", "his", "how",
+    "i", "if", "in", "into", "is", "it", "its", "itself",
     "just",
-    "me","more","most","my","myself",
-    "no","nor","not","now",
-    "of","off","on","once","only","or","other","our","ours","ourselves","out","over","own",
-    "same","she","should","so","some","such",
-    "than","that","the","their","theirs","them","themselves","then","there","these","they",
-    "this","those","through","to","too",
-    "under","until","up",
+    "me", "more", "most", "my", "myself",
+    "no", "nor", "not", "now",
+    "of", "off", "on", "once", "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own",
+    "same", "she", "should", "so", "some", "such",
+    "than", "that", "the", "their", "theirs", "them", "themselves", "then", "there", "these", "they",
+    "this", "those", "through", "to", "too",
+    "under", "until", "up",
     "very",
-    "was","we","were","what","when","where","which","while","who","whom","why","with","would",
-    "you","your","yours","yourself","yourselves"
+    "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why", "with", "would",
+    "you", "your", "yours", "yourself", "yourselves"
 }
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 
-# Only crawl within the seed families (safer than ".ics.uci.edu" broadly)
 ALLOWED_SUFFIXES = (
     ".ics.uci.edu",
     ".cs.uci.edu",
@@ -50,40 +54,24 @@ ALLOWED_SUFFIXES = (
     ".stat.uci.edu",
 )
 
-# Explicitly banned hosts (the #1 is gitlab)
+# HARD block known trap host(s)
 BANNED_HOSTS = {
     "gitlab.ics.uci.edu",
 }
 
-# Trap-ish path keywords that explode URL space or are useless for content
-BANNED_PATH_SUBSTRINGS = (
-    "/users/sign_in",
-    "/users/sign_up",
-    "/oauth",
-    "/login",
-    "/logout",
-    "/sessions",
-    "/admin",
-    "/search",
-)
-
-# Common “edit/diff/history/print” style traps
-BANNED_QUERY_SUBSTRINGS = (
-    "session", "sid", "phpsessid", "utm_",
-    "replytocom",
-    "action=edit", "action=login", "action=history",
-    "do=edit", "do=login", "do=history",
-    "diff=", "oldid=", "rev=",
-    "format=pdf", "format=print", "print=",
-    "ical=", "outlook-ical=", "export",
-)
-
-# Content thresholds
+# Pages with very few words are usually low-value (menus, redirects, login walls)
 MIN_WORDS_THRESHOLD = 50
+
+# Avoid very large HTML pages
 MAX_CONTENT_SIZE = 10 * 1024 * 1024  # 10MB
 
 
-def scraper(url, resp):
+# --------- Main scraper hook ---------
+def scraper(url: str, resp) -> list:
+    """
+    Called after downloading a URL.
+    Return a list of valid URLs to add to frontier.
+    """
     if not resp or resp.status != 200 or not resp.raw_response:
         return []
 
@@ -97,36 +85,38 @@ def scraper(url, resp):
         return []
 
     raw_content = getattr(resp.raw_response, "content", None)
-    if not raw_content:
+    if not raw_content or len(raw_content) == 0:
         return []
     if len(raw_content) > MAX_CONTENT_SIZE:
         return []
 
     page_url = defragment_url(resp.url if getattr(resp, "url", None) else url)
 
-    # Always extract links, but only count analytics if the page is valid + useful
+    # Extract links regardless, but only count analytics if page is valid + useful
     links = extract_next_links(page_url, resp)
-    next_links = [link for link in links if is_valid(link)]
+    valid_links = [link for link in links if is_valid(link)]
 
     if not is_valid(page_url):
-        return next_links
+        return valid_links
 
     text = extract_text(resp)
-    word_count = len(TOKEN_RE.findall(text))
-    if word_count < MIN_WORDS_THRESHOLD:
-        return next_links
+    words_all = TOKEN_RE.findall(text)
+    if len(words_all) < MIN_WORDS_THRESHOLD:
+        return valid_links
 
+    # Content dedupe (prevents near-identical pages inflating stats)
     text_hash = sha256(text.strip().encode("utf-8", errors="ignore")).hexdigest()
     with _lock:
         if text_hash in content_hashes:
-            return next_links
+            return valid_links
         content_hashes.add(text_hash)
 
     update_analytics(page_url, text)
-    return next_links
+    return valid_links
 
 
-def extract_next_links(url, resp):
+# --------- Link extraction ---------
+def extract_next_links(url: str, resp) -> list:
     if not resp or resp.status != 200 or not resp.raw_response:
         return []
 
@@ -161,7 +151,8 @@ def extract_next_links(url, resp):
     return list(out)
 
 
-def is_valid(url):
+# --------- URL filtering ---------
+def is_valid(url: str) -> bool:
     try:
         if not url:
             return False
@@ -175,57 +166,58 @@ def is_valid(url):
         if not host:
             return False
 
-        # Block known trap hosts
+        # HARD BLOCK gitlab (your trap)
         if host in BANNED_HOSTS:
             return False
 
-        # Stay in scope: seed families
+        # Must be in allowed domains
         if not any(host == suf.lstrip(".") or host.endswith(suf) for suf in ALLOWED_SUFFIXES):
             return False
-
-        # Additional “tool” subdomain blocks (optional but helpful)
-        # If you want strict crawling only on the public sites, uncomment:
-        # if host.endswith(".ics.uci.edu") and not host.startswith(("www.", "ics.", "cs.", "informatics.", "stat.")):
-        #     return False
 
         # No fragments
         if parsed.fragment:
             return False
 
-        path = (parsed.path or "").lower()
+        path_lower = (parsed.path or "").lower()
 
-        # Block obvious login/admin/search areas
-        for bad in BANNED_PATH_SUBSTRINGS:
-            if bad in path:
-                return False
-
-        # File extension filter
+        # Reject non-HTML-ish file extensions
         if re.match(
-            r".*\.(css|js|bmp|gif|jpe?g|ico|png|tiff?|mid|mp2|mp3|mp4|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv"
-            r"|pdf|ps|eps|tex|ppt|pptx|ppsx|doc|docx|xls|xlsx|data|dat|exe|bz2|tar|msi|bin|7z|dmg|iso|epub|dll"
-            r"|tgz|sha1|rtf|jar|csv|rm|smil|wmv|swf|wma|zip|rar|gz|json|xml|apk|img|war|py|r|m|ipynb)$",
-            path
+            r".*\.(css|js|bmp|gif|jpe?g|ico|png|tiff?|mid|mp2|mp3|mp4|wav|avi|mov|mpeg|ram|m4v|mkv|ogg|ogv|pdf"
+            r"|ps|eps|tex|ppt|pptx|ppsx|doc|docx|xls|xlsx|data|dat|exe|bz2|tar|msi|bin|7z|dmg|iso|epub|dll|tgz|sha1"
+            r"|rtf|jar|csv|rm|smil|wmv|swf|wma|zip|rar|gz|json|xml|apk|img|war|py|r|m|ipynb)$",
+            path_lower
         ):
+            return False
+
+        # Avoid obvious login/search/admin areas (common traps)
+        if any(x in path_lower for x in ["/login", "/logout", "/signin", "/sign_in", "/admin", "/search"]):
             return False
 
         # Query traps
         q = (parsed.query or "").lower()
         if q:
-            if any(b in q for b in BANNED_QUERY_SUBSTRINGS):
+            bad_q_substrings = (
+                "session", "sid", "phpsessid", "utm_",
+                "replytocom",
+                "action=edit", "action=login", "action=history",
+                "do=edit", "do=login", "do=history",
+                "diff=", "oldid=", "rev=",
+                "format=print", "print=", "export", "ical=", "outlook-ical="
+            )
+            if any(b in q for b in bad_q_substrings):
                 return False
-            # Too many params tends to explode
             if q.count("&") >= 4:
                 return False
 
-        # URL length (less strict than 200; 500 is safer for real pages)
-        if len(url) > 500:
-            return False
-
         # Depth + repetition traps
-        segments = [s for s in path.split("/") if s]
+        segments = [s for s in path_lower.split("/") if s]
         if len(segments) >= 12:
             return False
         if has_repeated_pattern(segments):
+            return False
+
+        # URL length (be reasonable)
+        if len(url) > 500:
             return False
 
         return True
@@ -234,6 +226,7 @@ def is_valid(url):
         return False
 
 
+# --------- Helpers ---------
 def defragment_url(u: str) -> str:
     try:
         clean, _ = urldefrag(u)
@@ -242,9 +235,10 @@ def defragment_url(u: str) -> str:
         return u
 
 
-def normalize_link(base_url, href):
+def normalize_link(base_url: str, href: str):
     if not href:
         return None
+
     href = href.strip()
     if not href:
         return None
@@ -255,11 +249,11 @@ def normalize_link(base_url, href):
     abs_url = urljoin(base_url, href)
     abs_url = defragment_url(abs_url)
 
-    # Normalize http -> https
+    # normalize http -> https
     if abs_url.startswith("http://"):
         abs_url = "https://" + abs_url[7:]
 
-    # Normalize trailing slash
+    # normalize trailing slash
     if abs_url.endswith("/") and len(abs_url) > len("https://a.b/"):
         abs_url = abs_url.rstrip("/")
 
@@ -323,7 +317,7 @@ def update_analytics(page_url: str, text: str) -> None:
             write_snapshot()
 
 
-def get_subdomain(u):
+def get_subdomain(u: str):
     try:
         host = (urlparse(u).hostname or "").lower()
         if host.endswith(".uci.edu"):
